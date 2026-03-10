@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Depends, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -171,6 +171,20 @@ class EmailTemplateUpdate(BaseModel):
     subject: Optional[str] = None
     html_content: Optional[str] = None
     is_default: Optional[bool] = None
+
+class BatchJob(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    batch_id: str
+    subject: str
+    template_id: Optional[str] = None
+    status: str = "queued"          # queued | processing | completed | failed
+    total: int = 0
+    successful: int = 0
+    failed: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class SMTPConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -588,36 +602,82 @@ async def send_single_email(request: EmailSendRequest):
         raise HTTPException(status_code=500, detail=error)
 
 
+async def process_bulk_emails_background(batch_id: str, emails: list, subject: str, html_content: str, template_id: Optional[str]):
+    """Background worker: sends emails one by one and updates batch progress in DB."""
+    await db.batch_jobs.update_one(
+        {"batch_id": batch_id},
+        {"$set": {"status": "processing", "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+
+    for email in emails:
+        try:
+            success, error = await send_email_smtp(email, subject, html_content)
+
+            log_entry = EmailLog(
+                recipient_email=email,
+                subject=subject,
+                status='sent' if success else 'failed',
+                error_message=error,
+                batch_id=batch_id,
+                template_id=template_id
+            )
+            doc = log_entry.model_dump()
+            doc['sent_at'] = doc['sent_at'].isoformat()
+            if doc.get('delivered_at'):
+                doc['delivered_at'] = doc['delivered_at'].isoformat()
+            await db.email_logs.insert_one(doc)
+
+            if success:
+                await db.batch_jobs.update_one(
+                    {"batch_id": batch_id},
+                    {"$inc": {"successful": 1}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+                )
+            else:
+                await db.batch_jobs.update_one(
+                    {"batch_id": batch_id},
+                    {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+                )
+        except Exception as e:
+            logger.error(f"Unexpected error processing email {email} in batch {batch_id}: {str(e)}")
+            await db.batch_jobs.update_one(
+                {"batch_id": batch_id},
+                {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+            )
+
+    await db.batch_jobs.update_one(
+        {"batch_id": batch_id},
+        {"$set": {"status": "completed", "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    logger.info(f"Batch {batch_id} completed.")
+
+
 @api_router.post("/email/bulk")
-async def send_bulk_emails(file: UploadFile = File(...), subject: str = "Message from Delta AI Academy", template_id: Optional[str] = None):
-    """Send bulk emails from CSV file"""
+async def send_bulk_emails(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    subject: str = "Message from Delta AI Academy",
+    template_id: Optional[str] = None
+):
+    """Queue a bulk email job. Returns immediately with a batch_id to track progress."""
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Please upload a CSV file")
-    
+
     content = await file.read()
     decoded = content.decode('utf-8')
-    
+
     # Get template
     html_content = DEFAULT_TEMPLATE
     if template_id:
         template = await db.email_templates.find_one({"id": template_id}, {"_id": 0})
         if template:
             html_content = template.get('html_content', DEFAULT_TEMPLATE)
-    
-    batch_id = str(uuid.uuid4())
-    results = {
-        "total": 0,
-        "successful": 0,
-        "failed": 0,
-        "details": []
-    }
-    
+
     # Parse CSV - handle both with and without headers
     lines = decoded.strip().split('\n')
     first_line = lines[0].strip().lower() if lines else ''
-    
+
     emails = []
-    
+
     if first_line in ['email', 'emails', 'e-mail', 'email_address', 'emailaddress']:
         reader = csv.DictReader(io.StringIO(decoded))
         for row in reader:
@@ -637,44 +697,63 @@ async def send_bulk_emails(file: UploadFile = File(...), subject: str = "Message
                 email = email.split(',')[0].strip()
             if email and '@' in email:
                 emails.append(email)
-    
-    # Send emails
-    for email in emails:
-        results["total"] += 1
 
-        try:
-            success, error = await send_email_smtp(email, subject, html_content)
+    if not emails:
+        raise HTTPException(status_code=400, detail="No valid email addresses found in the CSV file")
 
-            # Log each email
-            log_entry = EmailLog(
-                recipient_email=email,
-                subject=subject,
-                status='sent' if success else 'failed',
-                error_message=error,
-                batch_id=batch_id,
-                template_id=template_id
-            )
-            doc = log_entry.model_dump()
-            doc['sent_at'] = doc['sent_at'].isoformat()
-            if doc.get('delivered_at'):
-                doc['delivered_at'] = doc['delivered_at'].isoformat()
-            await db.email_logs.insert_one(doc)
+    # Create batch job record in DB
+    batch_id = str(uuid.uuid4())
+    batch_job = BatchJob(
+        batch_id=batch_id,
+        subject=subject,
+        template_id=template_id,
+        status="queued",
+        total=len(emails)
+    )
+    doc = batch_job.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    doc['updated_at'] = doc['updated_at'].isoformat()
+    await db.batch_jobs.insert_one(doc)
 
-            if success:
-                results["successful"] += 1
-                results["details"].append({"email": email, "status": "sent"})
-            else:
-                results["failed"] += 1
-                results["details"].append({"email": email, "status": "failed", "error": error})
-        except Exception as e:
-            logger.error(f"Unexpected error processing email {email}: {str(e)}")
-            results["failed"] += 1
-            results["details"].append({"email": email, "status": "failed", "error": str(e)})
-    
+    # Fire background task — response is returned before emails start sending
+    background_tasks.add_task(
+        process_bulk_emails_background,
+        batch_id, emails, subject, html_content, template_id
+    )
+
     return {
         "success": True,
         "batch_id": batch_id,
-        "results": results
+        "status": "queued",
+        "total_emails": len(emails),
+        "message": f"Bulk email job queued for {len(emails)} recipients. Use GET /api/email/bulk/{batch_id}/status to track progress."
+    }
+
+
+@api_router.get("/email/bulk/{batch_id}/status")
+async def get_bulk_email_status(batch_id: str):
+    """Poll the live progress of a bulk email batch job."""
+    job = await db.batch_jobs.find_one({"batch_id": batch_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch job not found")
+
+    total = job.get("total", 0)
+    successful = job.get("successful", 0)
+    failed = job.get("failed", 0)
+    processed = successful + failed
+    progress_pct = round((processed / total) * 100, 1) if total > 0 else 0
+
+    return {
+        "batch_id": batch_id,
+        "status": job.get("status"),          # queued | processing | completed | failed
+        "total": total,
+        "processed": processed,
+        "successful": successful,
+        "failed": failed,
+        "progress_percent": progress_pct,
+        "subject": job.get("subject"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
     }
 
 
