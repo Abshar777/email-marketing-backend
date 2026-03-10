@@ -641,30 +641,35 @@ async def send_bulk_emails(file: UploadFile = File(...), subject: str = "Message
     # Send emails
     for email in emails:
         results["total"] += 1
-        
-        success, error = await send_email_smtp(email, subject, html_content)
-        
-        # Log each email
-        log_entry = EmailLog(
-            recipient_email=email,
-            subject=subject,
-            status='sent' if success else 'failed',
-            error_message=error,
-            batch_id=batch_id,
-            template_id=template_id
-        )
-        doc = log_entry.model_dump()
-        doc['sent_at'] = doc['sent_at'].isoformat()
-        if doc.get('delivered_at'):
-            doc['delivered_at'] = doc['delivered_at'].isoformat()
-        await db.email_logs.insert_one(doc)
-        
-        if success:
-            results["successful"] += 1
-            results["details"].append({"email": email, "status": "sent"})
-        else:
+
+        try:
+            success, error = await send_email_smtp(email, subject, html_content)
+
+            # Log each email
+            log_entry = EmailLog(
+                recipient_email=email,
+                subject=subject,
+                status='sent' if success else 'failed',
+                error_message=error,
+                batch_id=batch_id,
+                template_id=template_id
+            )
+            doc = log_entry.model_dump()
+            doc['sent_at'] = doc['sent_at'].isoformat()
+            if doc.get('delivered_at'):
+                doc['delivered_at'] = doc['delivered_at'].isoformat()
+            await db.email_logs.insert_one(doc)
+
+            if success:
+                results["successful"] += 1
+                results["details"].append({"email": email, "status": "sent"})
+            else:
+                results["failed"] += 1
+                results["details"].append({"email": email, "status": "failed", "error": error})
+        except Exception as e:
+            logger.error(f"Unexpected error processing email {email}: {str(e)}")
             results["failed"] += 1
-            results["details"].append({"email": email, "status": "failed", "error": error})
+            results["details"].append({"email": email, "status": "failed", "error": str(e)})
     
     return {
         "success": True,
